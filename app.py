@@ -137,10 +137,12 @@ def search_web(query, max_results=5):
     payload = {
         "api_key": api_key,
         "query": query,
-        "search_depth": "basic",
+        # Advanced search returns richer evidence; Tavily can also synthesize
+        # an answer from the retrieved pages without a separate Gemini key.
+        "search_depth": "advanced",
         "topic": "general",
         "max_results": int(max_results),
-        "include_answer": False,
+        "include_answer": "advanced",
         "include_raw_content": False,
     }
     try:
@@ -162,7 +164,10 @@ def search_web(query, max_results=5):
                 "score": item.get("score"),
                 "domain": urlparse(url).netloc,
             })
-        return results, None
+        # Keep the synthesized answer separate from source snippets; it is an
+        # AI-generated summary, not independent proof of the claim.
+        answer = (data.get("answer") or "").strip()
+        return {"evidence": results, "answer": answer}, None
     except requests.Timeout:
         return [], "검색 요청 시간이 초과됐습니다. 잠시 후 다시 시도해 주세요."
     except requests.RequestException as exc:
@@ -170,39 +175,70 @@ def search_web(query, max_results=5):
     except (ValueError, TypeError):
         return [], "검색 서비스에서 읽을 수 없는 응답을 받았습니다."
 
-# ---- Conservative evidence assessment ----
-def assess_evidence(claim, evidence):
+# ---- Evidence assessment using Tavily's built-in answer ----
+def assess_evidence(claim, search_data):
+    evidence = search_data.get("evidence", []) if isinstance(search_data, dict) else []
+    answer = search_data.get("answer", "") if isinstance(search_data, dict) else ""
+
     if not evidence:
         return {
             "verdict": "판정 보류",
-            "confidence": "판정 불가",
-            "summary": "관련 검색 근거를 확보하지 못했습니다. 따라서 참·거짓을 판정하지 않습니다.",
-        }
-
-    usable = [
-        e for e in evidence
-        if len((e.get("content") or "").strip()) >= 60
-        and e.get("url", "").startswith(("http://", "https://"))
-    ]
-    distinct_domains = {e.get("domain") for e in usable if e.get("domain")}
-    if len(usable) < 2 or len(distinct_domains) < 2:
-        return {
-            "verdict": "판정 보류",
             "confidence": "근거 부족",
-            "summary": (
-                "검색 결과가 없거나 독립적인 출처가 충분하지 않습니다. "
-                "현재 자료만으로는 이 주장을 참·거짓으로 단정할 수 없습니다."
-            ),
+            "summary": "관련 검색 근거를 확보하지 못했습니다. 검색어를 바꾸거나 주장을 더 구체적으로 입력해 보세요.",
+            "ai_answer": answer,
+            "supporting_points": [],
+            "limitations": ["검색 결과가 없으므로 현재 자료만으로 참·거짓을 판단할 수 없습니다."],
         }
 
-    # No LLM-based truth judgement is made here. Search snippets are not proof.
+    # Use Tavily's generated synthesis for an initial assessment. We only assign
+    # a directional verdict when its wording contains a reasonably explicit cue.
+    # Otherwise we show the synthesis and leave the verdict open rather than guess.
+    text = answer.casefold()
+    false_cues = [
+        "거짓으로 확인", "사실이 아닙니다", "사실이 아니다", "잘못된 주장",
+        "허위 정보", "반박됩니다", "반박된다", "false claim", "is false", "not true",
+        "debunked", "misleading claim",
+    ]
+    true_cues = [
+        "사실로 확인", "사실입니다", "사실이다", "주장을 뒷받침", "근거가 있습니다",
+        "확인됩니다", "true claim", "is true", "supported by the evidence",
+        "evidence supports",
+    ]
+    partial_cues = ["일부 사실", "부분적으로 사실", "일부는 맞", "partly true", "partially true", "half true"]
+    uncertain_cues = ["확인할 수 없습니다", "판단하기 어렵", "근거가 충분하지", "불확실", "cannot determine", "insufficient evidence", "unclear"]
+
+    usable = [e for e in evidence if (e.get("content") or "").strip() and e.get("url", "").startswith(("http://", "https://"))]
+    domains = {e.get("domain") for e in usable if e.get("domain")}
+
+    if answer and any(cue in text for cue in partial_cues):
+        verdict, confidence = "일부 사실", "AI 요약 기반 · 보통"
+    elif answer and any(cue in text for cue in false_cues) and not any(cue in text for cue in uncertain_cues):
+        verdict, confidence = "거짓", "AI 요약 기반 · 보통"
+    elif answer and any(cue in text for cue in true_cues) and not any(cue in text for cue in uncertain_cues):
+        verdict, confidence = "참", "AI 요약 기반 · 보통"
+    else:
+        verdict = "추가 검토 필요" if len(usable) >= 2 else "판정 보류"
+        confidence = "제한적 근거" if len(domains) >= 2 else "근거 부족"
+
+    if answer:
+        summary = answer
+    else:
+        summary = "Tavily가 별도의 종합 답변을 제공하지 않았습니다. 아래 출처의 원문을 확인해 주세요."
+
+    limitations = [
+        "Tavily의 답변은 검색된 웹페이지를 바탕으로 생성된 AI 요약이며, 사실을 보증하지 않습니다.",
+        "검색 관련도 점수는 사실일 확률이 아닙니다. 출처 원문과 발행 날짜를 확인하세요.",
+    ]
+    if len(domains) < 2:
+        limitations.append("서로 다른 출처의 교차 확인이 충분하지 않습니다.")
+
     return {
-        "verdict": "추가 검토 필요",
-        "confidence": "제한적 근거",
-        "summary": (
-            "관련 검색 결과를 찾았지만, 검색 요약문만으로 주장의 참·거짓을 확정하지 않습니다. "
-            "아래 출처의 원문과 발행 기관, 날짜, 연구 방법을 직접 확인해 주세요."
-        ),
+        "verdict": verdict,
+        "confidence": confidence,
+        "summary": summary,
+        "ai_answer": answer,
+        "supporting_points": [f"관련 출처 {len(usable)}개, 서로 다른 도메인 {len(domains)}개를 확인했습니다."],
+        "limitations": limitations,
     }
 
 # ---- Session state ----
@@ -276,16 +312,16 @@ if page == "주장 검증":
             else:
                 query = search_query.strip() or claim.strip()
                 with st.spinner("웹에서 관련 근거를 검색하고 있습니다..."):
-                    evidence, error = search_web(query, result_count)
+                    search_data, error = search_web(query, result_count)
                 if error:
                     st.error(error)
-                    st.info("API 키 설정 전에도 화면과 기록 기능은 사용할 수 있습니다.")
+                    st.info("Tavily API 키와 Streamlit Secrets 설정을 확인해 주세요.")
                 else:
-                    assessment = assess_evidence(claim.strip(), evidence)
+                    assessment = assess_evidence(claim.strip(), search_data)
                     st.session_state.last_result = {
                         "claim": claim.strip(),
                         "query": query,
-                        "evidence": evidence,
+                        "evidence": search_data.get("evidence", []),
                         **assessment,
                     }
                     st.rerun()
@@ -305,9 +341,9 @@ if page == "주장 검증":
             """,
             unsafe_allow_html=True,
         )
-        st.warning(
-            "현재 버전은 검색 결과를 모으고 근거 수준을 보수적으로 분류합니다. "
-            "AI가 원문 전체를 읽고 사실 여부를 확정하는 기능은 포함하지 않습니다."
+        st.info(
+            "Tavily의 고급 검색과 AI 종합 답변을 함께 사용합니다. 판정은 답변에 명시적인 단서가 있을 때만 방향을 표시하며, "
+            "애매한 경우에는 추가 검토가 필요하다고 안내합니다."
         )
 
     result = st.session_state.last_result
@@ -441,7 +477,7 @@ elif page == "사용 안내":
     st.markdown(
         """
         **1. API 키 설정**
-        - Tavily 키는 웹 검색에 사용하고, Gemini 키는 검색 결과를 바탕으로 한 보조 분석에 사용합니다.
+        - Tavily 키 하나로 고급 웹 검색과 Tavily AI 종합 답변을 사용합니다. 이 버전은 Gemini 키가 필요하지 않습니다.
         - API 키는 GitHub 코드에 적지 말고 Streamlit Secrets에 입력합니다.
 
         **2. 사용자 이름 입력**
@@ -463,7 +499,8 @@ elif page == "사용 안내":
         **6. 판정 기준**
         - 출처가 없거나 부족하면 '판정 보류'로 표시합니다.
         - AI 분석은 검색 스니펫에 기반한 보조 의견이며, 실제 사실 확인을 대신하지 않습니다.
-        - API 오류나 근거 부족 시 억지로 참·거짓을 판정하지 않습니다.
+        - 명시적인 단서가 있는 경우 참·거짓·일부 사실을 표시할 수 있지만, 답변이 애매하면 추가 검토가 필요하다고 표시합니다.
+        - 자동 판정은 AI 요약의 표현을 바탕으로 한 1차 분류이므로, 중요한 주장은 원문 출처를 확인하세요.
         """
     )
     st.markdown("### API 상태")
@@ -471,10 +508,7 @@ elif page == "사용 안내":
         st.success("Tavily 검색 API 키가 설정되어 있습니다.")
     else:
         st.warning("TAVILY_API_KEY가 설정되지 않았습니다. 검색 기능을 쓰려면 Secrets를 설정하세요.")
-    if get_secret("GEMINI_API_KEY"):
-        st.success("Gemini API 키가 설정되어 있습니다. 검색 결과 기반 보조 분석을 사용할 수 있습니다.")
-    else:
-        st.info("GEMINI_API_KEY가 없으면 자동 판정 대신 보수적인 근거 부족 안내만 표시합니다.")
+    st.info("현재 분석은 Tavily의 검색 결과와 AI 종합 답변을 사용합니다. Gemini 키는 필요하지 않습니다.")
 
 st.markdown("---")
 st.caption(
